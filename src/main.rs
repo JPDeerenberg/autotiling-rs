@@ -1,33 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, error, info};
 use swayipc::{Connection, Event, EventType, Node, NodeLayout, NodeType, WindowChange};
 
-/// Configuration for master-stack layout
-/// Maps application class names to their master window percentage (0.5 to 0.7)
+/// Configuration for the autotiler
 #[derive(Debug, Clone)]
-struct MasterStackConfig {
-    /// Application class -> percentage of screen to occupy (50-70%)
-    master_apps: HashMap<String, f32>,
-    /// Whether to enable automatic window balancing
+struct AutoTileConfig {
+    workspaces: HashSet<i32>,
     enable_balance: bool,
-}
-
-impl Default for MasterStackConfig {
-    fn default() -> Self {
-        let mut master_apps = HashMap::new();
-        // Example: games and browsers get 60% of screen
-        master_apps.insert("firefox".to_string(), 0.6);
-        master_apps.insert("chromium".to_string(), 0.6);
-        master_apps.insert("steam".to_string(), 0.65);
-        
-        Self {
-            master_apps,
-            enable_balance: true,
-        }
-    }
 }
 
 /// Calculate the aspect ratio of a container (width / height)
@@ -35,268 +17,161 @@ fn calculate_aspect_ratio(node: &Node) -> f32 {
     let width = node.rect.width as f32;
     let height = node.rect.height as f32;
     if height == 0.0 {
-        1.0
+        1.0 // Avoid division by zero, though physics usually prevents 0 height windows
     } else {
         width / height
     }
 }
 
-/// Determine if a split should be made vertically (result: SplitV) or horizontally (result: SplitH)
-/// based on the aspect ratio of the parent container.
-/// This ensures windows stay as square as possible.
-fn calculate_optimal_split(parent_node: &Node) -> NodeLayout {
-    let aspect_ratio = calculate_aspect_ratio(parent_node);
-    
-    // If the container is wider than tall, split vertically (SplitV) to divide the width
-    // If the container is taller than wide, split horizontally (SplitH) to divide the height
-    if aspect_ratio > 1.0 {
-        NodeLayout::SplitV
-    } else {
-        NodeLayout::SplitH
-    }
-}
-
-/// Implement recursive spiral/even-split autotiling algorithm
-/// This algorithm recursively applies optimal splits to maintain square windows
-fn apply_spiral_autotile(node: &Node, target_layout: NodeLayout) -> Option<NodeLayout> {
-    // Don't apply to non-container nodes or special layouts
-    if node.node_type == NodeType::FloatingCon
-        || node.layout == NodeLayout::Stacked
-        || node.layout == NodeLayout::Tabbed
-    {
-        return None;
-    }
-
-    // If the target layout is already set, return it
-    if node.layout == target_layout {
-        return Some(target_layout);
-    }
-
-    // Return the optimal layout for this node
-    Some(target_layout)
-}
-
-/// Check if a window should be treated as a master window
-fn is_master_window(node: &Node, config: &MasterStackConfig) -> bool {
-    if let Some(window_properties) = &node.window_properties {
-        if let Some(class) = &window_properties.class {
-            return config.master_apps.contains_key(class);
-        }
-    }
-    false
-}
-
-/// Apply master-stack layout: master window takes 50-70% of screen, others tile in remaining space
-fn apply_master_stack_layout(
-    conn: &mut Connection,
-    focused_node: &Node,
-    config: &MasterStackConfig,
-) -> Result<()> {
-    if !is_master_window(focused_node, config) {
-        return Ok(());
-    }
-
-    if let Some(window_properties) = &focused_node.window_properties {
-        if let Some(class) = &window_properties.class {
-            if let Some(&master_percentage) = config.master_apps.get(class) {
-                // Clamp to valid range
-                let master_pct = master_percentage.clamp(0.5, 0.7);
-                
-                debug!(
-                    "Applying master-stack layout for {} with {}% master size",
-                    class,
-                    (master_pct * 100.0) as i32
-                );
-
-                // This would require more complex container manipulation
-                // For now, we provide the foundation - actual implementation depends on
-                // container hierarchy and sway's capabilities
-                return Ok(());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Balance windows in the current container - resize them to equal sizes
-fn balance_windows(conn: &mut Connection) -> Result<()> {
-    debug!("Executing balance command");
-    conn.run_command("balance")?;
-    Ok(())
-}
-
-/// Main autotiling function: decide split direction and apply layout
-fn switch_splitting_advanced(
-    conn: &mut Connection,
-    workspaces: &HashSet<i32>,
-    config: &MasterStackConfig,
-) -> Result<()> {
-    // Filter by workspace if specified
-    if !workspaces.is_empty() {
-        let focused = conn
-            .get_workspaces()
-            .context("get_workspaces() failed")?
-            .into_iter()
-            .find(|w| w.focused)
-            .map(|w| w.num);
-
-        if let Some(num) = focused {
-            if !workspaces.contains(&num) {
-                return Ok(());
-            }
-        } else {
-            return Ok(());
-        }
-    }
-
+/// The actual brains of the operation.
+/// Determines if we should split Horizontally or Vertically based on the *Focused* node.
+fn update_split_direction(conn: &mut Connection, config: &AutoTileConfig) -> Result<()> {
+    // 1. Get the tree to find what we are looking at
     let tree = conn.get_tree().context("get_tree() failed")?;
-    let focused_node = tree
-        .find_focused_as_ref(|n| n.focused)
-        .ok_or_else(|| anyhow!("Could not find the focused node"))?;
-
-    // Skip special layouts and floating windows
-    let is_stacked = focused_node.layout == NodeLayout::Stacked;
-    let is_tabbed = focused_node.layout == NodeLayout::Tabbed;
-    let is_floating = focused_node.node_type == NodeType::FloatingCon;
-    let is_full_screen = focused_node.percent.unwrap_or(1.0) > 1.0;
-
-    if is_floating || is_full_screen || is_stacked || is_tabbed {
-        return Ok(());
-    }
-
-    // Find the parent container which holds the focused node
-    let parent = tree
-        .find_focused_as_ref(|n| n.nodes.iter().any(|n| n.focused))
-        .ok_or_else(|| anyhow!("Could not find parent container"))?;
-
-    // Calculate optimal split based on aspect ratio of parent container
-    // This ensures new windows maintain near-square proportions
-    let optimal_split = calculate_optimal_split(parent);
-
-    // Only change layout if it differs from current
-    if optimal_split == parent.layout {
-        return Ok(());
-    }
-
-    debug!(
-        "Changing layout from {:?} to {:?} (aspect ratio: {:.2})",
-        parent.layout,
-        optimal_split,
-        calculate_aspect_ratio(parent)
-    );
-
-    let cmd = match optimal_split {
-        NodeLayout::SplitV => "splitv",
-        NodeLayout::SplitH => "splith",
-        _ => return Ok(()),
+    
+    // 2. Find the focused node
+    let focused_node = match tree.find_focused_as_ref(|n| n.focused) {
+        Some(node) => node,
+        None => return Ok(()), // No focus, nothing to do
     };
 
-    conn.run_command(cmd).context("run_command failed")?;
+    // 3. Check workspace filter
+    if !config.workspaces.is_empty() {
+        // We have to walk up to find the workspace or check current workspace
+        // Simpler approach: verify current workspace
+        let workspaces = conn.get_workspaces()?;
+        if let Some(focused_ws) = workspaces.iter().find(|w| w.focused) {
+            if !config.workspaces.contains(&focused_ws.num) {
+                return Ok(());
+            }
+        }
+    }
 
-    // Check if this is a master window and apply master-stack if needed
-    apply_master_stack_layout(conn, focused_node, config)?;
+    // 4. Skip floating, tabbed, stacked, or fullscreen windows
+    // We don't want to mess with manual layouts
+    if focused_node.node_type == NodeType::FloatingCon
+        || focused_node.layout == NodeLayout::Stacked
+        || focused_node.layout == NodeLayout::Tabbed
+        || focused_node.percent.unwrap_or(0.0) > 1.0 
+    {
+        return Ok(());
+    }
+
+    // 5. Calculate Aspect Ratio of the FOCUSED node (not the parent!)
+    // If we are Wide (>1.0), we want the NEXT window to be to the side -> SplitH
+    // If we are Tall (<1.0), we want the NEXT window to be below -> SplitV
+    let ratio = calculate_aspect_ratio(focused_node);
+    
+    // In Sway:
+    // "splith" = Split Horizontal = Children arranged Left-to-Right
+    // "splitv" = Split Vertical = Children arranged Top-to-Bottom
+    
+    let desired_layout = if ratio > 1.1 {
+        // Wide window: Split it horizontally so the new one goes next to it
+        "splith"
+    } else {
+        // Tall window: Split it vertically so the new one goes below
+        "splitv"
+    };
+
+    debug!("Node {} Ratio: {:.2} -> Command: {}", focused_node.id, ratio, desired_layout);
+    
+    // Only run the command. Sway is smart enough not to break things if we spam it,
+    // but ideally we'd check the current split status. 
+    // However, 'split' commands set the split for the *future* window or the *current* container structure.
+    conn.run_command(desired_layout).context("Failed to set split")?;
 
     Ok(())
 }
 
-/// Backward-compatible wrapper function using default configuration
-fn switch_splitting(conn: &mut Connection, workspaces: &HashSet<i32>) -> Result<()> {
-    let config = MasterStackConfig::default();
-    switch_splitting_advanced(conn, workspaces, &config)
+fn balance_siblings(conn: &mut Connection) -> Result<()> {
+    // This runs 'balance' which equalizes the size of siblings in the current container
+    conn.run_command("balance")?;
+    Ok(())
 }
 
 #[derive(Parser)]
 #[clap(version, author, about)]
 struct Cli {
-    /// Activate autotiling only on this workspace. More than one workspace may be specified.
+    /// Activate autotiling only on this workspace.
     #[clap(long, short = 'w')]
     workspace: Vec<i32>,
 
-    /// Enable automatic window balancing after new window is mapped
+    /// Enable automatic window balancing (run 'balance' on new windows)
     #[clap(long, default_value_t = true)]
     balance: bool,
-
-    /// Application class name to treat as master window (can be specified multiple times)
-    /// Example: --master-app firefox --master-app steam
-    #[clap(long)]
-    master_app: Vec<String>,
-
-    /// Master window percentage of screen (50-70), applied to all master apps
-    #[clap(long, default_value_t = 0.6)]
-    master_percent: f32,
 }
 
 fn main() -> Result<()> {
     env_logger::init();
-
     let args = Cli::parse();
-    let workspace_set: HashSet<i32> = args.workspace.into_iter().collect();
+    
+    let config = AutoTileConfig {
+        workspaces: args.workspace.into_iter().collect(),
+        enable_balance: args.balance,
+    };
 
-    // Build master stack configuration from CLI args
-    let mut master_stack_config = MasterStackConfig::default();
-    let master_percent = args.master_percent.clamp(0.5, 0.7);
+    info!("Jarvis Autotiling initialized. Workspaces: {:?}, Balance: {}", 
+        config.workspaces, config.enable_balance);
 
-    // If custom master apps provided, use those instead of defaults
-    if !args.master_app.is_empty() {
-        master_stack_config.master_apps.clear();
-        for app in args.master_app {
-            master_stack_config.master_apps.insert(app, master_percent);
-        }
+    // Connect to Sway
+    let mut conn = Connection::new().context("Failed to connect to Sway IPC")?;
+    
+    // Subscribe to Window events. 
+    // THIS is how you do it, Tony. No more 'while loop sleep'.
+    let events = Connection::new()
+        .context("Failed to open subscription connection")?
+        .subscribe(&[EventType::Window])
+        .context("Failed to subscribe to window events")?;
+
+    // Initial pass: fix the currently focused window immediately
+    if let Err(e) = update_split_direction(&mut conn, &config) {
+        error!("Initial setup failed: {}", e);
     }
 
-    master_stack_config.enable_balance = args.balance;
-
-    info!(
-        "Starting autotiling with {} workspaces, balance={}, master_apps={:?}",
-        if workspace_set.is_empty() {
-            "all".to_string()
-        } else {
-            format!("{:?}", workspace_set)
-        },
-        master_stack_config.enable_balance,
-        master_stack_config.master_apps.keys().collect::<Vec<_>>()
-    );
-
-    let mut conn = Connection::new().context("failed to connect to sway ipc")?;
-    let mut event_conn = Connection::new().context("failed to create event connection")?;
-
-    // Subscribe to both window focus and window mapping events
-    let mut events = event_conn
-        .subscribe(&[EventType::Window])
-        .context("subscribe failed")?;
-
+    // Event Loop
     for event in events {
-        let event = event.context("error reading event")?;
         match event {
-            Event::Window(e) => {
+            Ok(Event::Window(e)) => {
                 match e.change {
                     WindowChange::Focus => {
-                        // Window focus event - recompute optimal split direction
-                        if let Err(err) = switch_splitting_advanced(
-                            &mut conn,
-                            &workspace_set,
-                            &master_stack_config,
-                        ) {
-                            error!("switch_splitting_advanced error: {:#}", err);
+                        // When focus changes, we determine how the *next* window should open
+                        // based on the dimensions of the window we just focused.
+                        if let Err(err) = update_split_direction(&mut conn, &config) {
+                            error!("Error handling focus: {}", err);
                         }
                     }
                     WindowChange::New => {
-                        // New window mapped - apply balance if enabled
-                        if master_stack_config.enable_balance {
-                            // Small delay to ensure sway has updated the tree
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            if let Err(err) = balance_windows(&mut conn) {
-                                error!("balance_windows error: {:#}", err);
+                        // A new window just appeared. 
+                        // It will inherit the split we set on the previous 'Focus' event.
+                        // Now we set the split for *this* new window (recursion).
+                        if let Err(err) = update_split_direction(&mut conn, &config) {
+                            error!("Error handling new window: {}", err);
+                        }
+
+                        // If enabled, balance the container so everything looks pretty
+                        if config.enable_balance {
+                            if let Err(err) = balance_siblings(&mut conn) {
+                                error!("Error balancing: {}", err);
                             }
                         }
                     }
-                    _ => {
-                        // Ignore other window change events (title, fullscreen, etc.)
+                    WindowChange::Close => {
+                        // If a window closes, re-balance the survivors
+                        if config.enable_balance {
+                            if let Err(err) = balance_siblings(&mut conn) {
+                                error!("Error balancing: {}", err);
+                            }
+                        }
                     }
+                    _ => {}
                 }
             }
-            _ => {}
+            Ok(_) => {} // Ignore other events
+            Err(e) => {
+                error!("Event stream error: {}", e);
+                break; 
+            }
         }
     }
 
