@@ -40,15 +40,17 @@ fn switch_splitting(conn: &mut Connection, workspaces: &HashSet<i32>) -> Result<
         return Ok(());
     }
 
-    let new_layout = if focused_node.rect.height > focused_node.rect.width {
+    let parent = tree
+        .find_focused_as_ref(|n| n.nodes.iter().any(|n| n.focused))
+        .ok_or_else(|| anyhow!("No parent"))?;
+
+    // Decide split direction based on parent container's aspect ratio
+    // to distribute space more evenly among children
+    let new_layout = if parent.rect.height > parent.rect.width {
         NodeLayout::SplitV
     } else {
         NodeLayout::SplitH
     };
-
-    let parent = tree
-        .find_focused_as_ref(|n| n.nodes.iter().any(|n| n.focused))
-        .ok_or_else(|| anyhow!("No parent"))?;
 
     if new_layout == parent.layout {
         return Ok(());
